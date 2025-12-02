@@ -9,9 +9,10 @@ import { cn } from "@/lib/utils";
 
 interface DateTimeInputProps {
   onPredict: (date: Date | undefined, hour: string) => void;
+  loading?: boolean;
 }
 
-export const DateTimeInput = ({ onPredict }: DateTimeInputProps) => {
+export const DateTimeInput = ({ onPredict, loading = false }: DateTimeInputProps) => {
   const [date, setDate] = useState<Date>();
   const [hour, setHour] = useState<string>("12");
 
@@ -74,9 +75,10 @@ export const DateTimeInput = ({ onPredict }: DateTimeInputProps) => {
         <div className="flex-1 w-full md:pt-6">
           <Button
             onClick={handlePredict}
-            className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold"
+            disabled={loading}
+            className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Get Prediction
+            {loading ? "Loading..." : "Get Prediction"}
           </Button>
         </div>
       </div>

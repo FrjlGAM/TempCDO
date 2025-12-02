@@ -1,34 +1,30 @@
-import { useEffect, useState } from "react";
+import React from "react";
 import dayImage from "@/assets/day.png";
 import nightImage from "@/assets/night.png";
 import { cn } from "@/lib/utils";
 
-export const WeatherHeader = () => {
-  const [isDay, setIsDay] = useState(true);
-  const [currentTime, setCurrentTime] = useState(new Date());
+interface WeatherHeaderProps {
+  temperature: number;
+  queriedDate: Date;
+  queriedHour: number;
+}
 
-  useEffect(() => {
-    const updateTime = () => {
-      const now = new Date();
-      setCurrentTime(now);
-      
-      const hour = now.getHours();
-      // Day mode: 6:00 AM (6) to 6:00 PM (18)
-      // Night mode: 6:01 PM (18:01) to 5:59 AM (5:59)
-      setIsDay(hour >= 6 && hour < 18);
-    };
+export const WeatherHeader = ({ temperature, queriedDate, queriedHour }: WeatherHeaderProps) => {
+  // Determine day/night mode based on queried hour
+  // Day mode: 6:00 AM (6) to 5:59 PM (17)
+  // Night mode: 6:00 PM (18) to 5:59 AM (5)
+  const isDay = queriedHour >= 6 && queriedHour < 18;
+  
+  // Debug: Log which image is being used
+  console.log(`WeatherHeader: Hour ${queriedHour}, isDay: ${isDay}, using image: ${isDay ? 'day.png' : 'night.png'}`);
 
-    updateTime();
-    const interval = setInterval(updateTime, 1000);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  const formatTime = (date: Date) => {
+  const formatTime = (hour: number) => {
+    // Format hour as HH:00 AM/PM
+    const date = new Date();
+    date.setHours(hour, 0, 0, 0);
     return date.toLocaleTimeString("en-US", {
       hour: "2-digit",
       minute: "2-digit",
-      second: "2-digit",
       hour12: true,
     });
   };
@@ -50,9 +46,16 @@ export const WeatherHeader = () => {
           backgroundImage: `url(${isDay ? dayImage : nightImage})`,
           backgroundSize: "cover",
           backgroundPosition: "center",
+          backgroundRepeat: "no-repeat",
         }}
       >
-        <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-black/20 to-black/50" />
+        <div 
+          className={`absolute inset-0 bg-gradient-to-b ${
+            isDay 
+              ? "from-black/30 via-black/20 to-black/50" 
+              : "from-black/20 via-black/10 to-black/30"
+          }`}
+        />
         
         <div className="relative z-10 p-8">
           <div className="flex justify-between items-start mb-8">
@@ -71,8 +74,10 @@ export const WeatherHeader = () => {
             )}
             style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}
             >
-              <p className="text-lg font-semibold">{formatTime(currentTime)}</p>
-              <p className="text-sm opacity-90">{formatDate(currentTime)}</p>
+              <p className="text-lg font-semibold">{formatTime(queriedHour)}</p>
+              <p className="text-sm opacity-90">
+                {formatDate(queriedDate)}
+              </p>
             </div>
           </div>
 
@@ -85,7 +90,7 @@ export const WeatherHeader = () => {
               )}
               style={{ textShadow: '3px 3px 6px rgba(0,0,0,0.9)' }}
             >
-              26°
+              {Math.round(temperature)}°
             </span>
           </div>
           <CloudIcon className={cn(
