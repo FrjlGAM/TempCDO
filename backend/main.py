@@ -34,11 +34,131 @@ app.add_middleware(
 # Global variable to store the loaded model
 model = None
 
+# Global variable to store the historical temperature data
+historical_data = None
+
 # Get the path to the model file (assuming it's in the project root)
 MODEL_PATH = Path(__file__).parent.parent / "temp_forecaster_model.joblib"
 
+# Get the path to the historical data file
+HISTORICAL_DATA_PATH = Path(__file__).parent.parent / "hourly_data_new.csv"
+
 # Feature names will be extracted from the model after loading
 EXPECTED_FEATURES = None
+
+def load_historical_data():
+    """Load the historical temperature dataset from CSV"""
+    global historical_data
+    if historical_data is None:
+        if not HISTORICAL_DATA_PATH.exists():
+            raise FileNotFoundError(f"Historical data file not found at {HISTORICAL_DATA_PATH}")
+        try:
+            # Read CSV file
+            df = pd.read_csv(HISTORICAL_DATA_PATH)
+            
+            # Parse datetime column (format: "1/1/2024 0:00")
+            df['datetime'] = pd.to_datetime(df['datetime'], format='%m/%d/%Y %H:%M')
+            
+            # Sort by datetime to ensure proper ordering
+            df = df.sort_values('datetime').reset_index(drop=True)
+            
+            # Create a datetime index for fast lookups
+            df.set_index('datetime', inplace=True)
+            
+            # Ensure temperature_2m column exists and is numeric
+            if 'temperature_2m' not in df.columns:
+                raise ValueError("temperature_2m column not found in historical data")
+            df['temperature_2m'] = pd.to_numeric(df['temperature_2m'], errors='coerce')
+            
+            historical_data = df
+            print(f"Historical data loaded successfully from {HISTORICAL_DATA_PATH}")
+            print(f"Data range: {df.index.min()} to {df.index.max()}")
+            print(f"Total records: {len(df)}")
+        except Exception as e:
+            raise Exception(f"Error loading historical data: {str(e)}")
+    return historical_data
+
+def get_historical_temperature(target_datetime: datetime):
+    """
+    Get historical temperature for a specific datetime.
+    Returns None if data is not available.
+    """
+    if historical_data is None:
+        return None
+    
+    # Round to nearest hour
+    target_datetime = target_datetime.replace(minute=0, second=0, microsecond=0)
+    
+    try:
+        # Try to get exact match
+        if target_datetime in historical_data.index:
+            return historical_data.loc[target_datetime, 'temperature_2m']
+        
+        # If exact match not found, try to find nearest (within 1 hour)
+        # Get the closest datetime
+        idx = historical_data.index.get_indexer([target_datetime], method='nearest')[0]
+        closest_datetime = historical_data.index[idx]
+        
+        # Only return if within 1 hour
+        if abs((closest_datetime - target_datetime).total_seconds()) <= 3600:
+            return historical_data.iloc[idx]['temperature_2m']
+        
+        return None
+    except Exception as e:
+        print(f"Error getting historical temperature for {target_datetime}: {str(e)}")
+        return None
+
+def get_lag_features_and_rolling_stats(target_datetime: datetime, hour: int):
+    """
+    Get lag features and rolling statistics from historical data.
+    
+    Returns:
+        dict with keys: lag_1, lag_3, lag_24, rolling_mean_24, rolling_std_24
+        Values are None if data is not available
+    """
+    result = {
+        'lag_1': None,
+        'lag_3': None,
+        'lag_24': None,
+        'rolling_mean_24': None,
+        'rolling_std_24': None
+    }
+    
+    if historical_data is None:
+        return result
+    
+    # Round target datetime to nearest hour
+    target_datetime = target_datetime.replace(minute=0, second=0, microsecond=0)
+    
+    # Get lag_1: 1 hour ago
+    lag_1_datetime = target_datetime - timedelta(hours=1)
+    result['lag_1'] = get_historical_temperature(lag_1_datetime)
+    
+    # Get lag_3: 3 hours ago
+    lag_3_datetime = target_datetime - timedelta(hours=3)
+    result['lag_3'] = get_historical_temperature(lag_3_datetime)
+    
+    # Get lag_24: 24 hours ago (same hour yesterday)
+    lag_24_datetime = target_datetime - timedelta(hours=24)
+    result['lag_24'] = get_historical_temperature(lag_24_datetime)
+    
+    # Get rolling statistics: last 24 hours
+    # Get temperatures for the last 24 hours (including current hour)
+    rolling_temps = []
+    for i in range(24):
+        check_datetime = target_datetime - timedelta(hours=i)
+        temp = get_historical_temperature(check_datetime)
+        if temp is not None:
+            rolling_temps.append(temp)
+    
+    if len(rolling_temps) >= 1:
+        result['rolling_mean_24'] = np.mean(rolling_temps)
+        if len(rolling_temps) > 1:
+            result['rolling_std_24'] = np.std(rolling_temps)
+        else:
+            result['rolling_std_24'] = 2.8  # Default std if only one value
+    
+    return result
 
 def load_model():
     """Load the ML model from the joblib file and extract feature names"""
@@ -59,15 +179,16 @@ def load_model():
             raise Exception(f"Error loading model: {str(e)}")
     return model
 
-# Load model on startup
+# Load model and historical data on startup
 @app.on_event("startup")
 async def startup_event():
-    """Load the model when the application starts"""
+    """Load the model and historical data when the application starts"""
     try:
+        load_historical_data()
         load_model()
         print("FastAPI server started and model loaded successfully")
     except Exception as e:
-        print(f"Warning: Could not load model on startup: {str(e)}")
+        print(f"Warning: Could not load model or historical data on startup: {str(e)}")
 
 # Request/Response models
 class PredictionRequest(BaseModel):
@@ -142,6 +263,9 @@ async def predict_single(request: SinglePredictionRequest):
         if not (0 <= hour <= 23):
             raise HTTPException(status_code=400, detail="Hour must be between 0 and 23")
         
+        # Set the hour on the date object
+        date_obj = date_obj.replace(hour=hour, minute=0, second=0, microsecond=0)
+        
         # Create features for the requested prediction
         features_df = create_features(date_obj, hour)
         
@@ -188,68 +312,51 @@ async def forecast_daily(request: DailyForecastRequest):
         hourly_forecast = []
         temp_history = {}
         
-        # Calculate seasonal adjustment once for this date (used in fallback estimates)
-        day_of_year = date_obj.timetuple().tm_yday
-        seasonal_temp_adjustment = np.sin(2 * np.pi * (day_of_year - 80) / 365.0) * 2.5
-        daily_temp_variation = np.sin(2 * np.pi * day_of_year / 7.0) * 0.8
-        seasonal_temp_adjustment += daily_temp_variation
-        
         for hour in range(24):
             # Calculate the datetime for this hour
             forecast_datetime = date_obj.replace(hour=hour, minute=0, second=0, microsecond=0)
             
-            # Prepare historical temperatures for lag features
-            # Use actual predicted temperatures from previous hours when available
-            historical_temps = {}
-            if hour >= 1:
-                # Use the actual predicted temperature from the previous hour
-                prev_temp = temp_history.get(hour-1)
-                if prev_temp is None:
-                    # Estimate based on hour pattern if not available
-                    base_est = 28.0 + seasonal_temp_adjustment
-                    prev_hour = hour - 1
-                    prev_temp = base_est + np.sin(2 * np.pi * prev_hour / 24) * 5.0
-                historical_temps[1] = prev_temp
-            if hour >= 3:
-                # Use the actual predicted temperature from 3 hours ago
-                prev_3_temp = temp_history.get(hour-3)
-                if prev_3_temp is None:
-                    base_est = 28.0 + seasonal_temp_adjustment
-                    prev_3_hour = hour - 3
-                    prev_3_temp = base_est + np.sin(2 * np.pi * prev_3_hour / 24) * 5.0
-                historical_temps[3] = prev_3_temp
-            # For lag_24, we'd need previous day's data, so estimate based on hour pattern
-            if hour == 0:
-                # Estimate previous day midnight - use typical night temp
-                base_est = 28.0 + seasonal_temp_adjustment
-                historical_temps[24] = base_est - 3.0  # Night is cooler
-            else:
-                # Use midnight temp as base, then adjust for current hour pattern
-                midnight_temp = temp_history.get(0)
-                if midnight_temp is None:
-                    base_est = 28.0 + seasonal_temp_adjustment
-                    midnight_temp = base_est - 3.0
-                # Estimate what temp would be at this hour yesterday
-                hour_factor = np.sin(2 * np.pi * hour / 24) * 5.0
-                historical_temps[24] = midnight_temp + hour_factor
+            # Get historical temperatures for lag features from the dataset
+            hist_features = get_lag_features_and_rolling_stats(forecast_datetime, hour)
             
-            # Calculate rolling statistics if we have enough history
-            if len(temp_history) >= 24:
-                recent_temps = list(temp_history.values())[-24:]
-                historical_temps['mean_24'] = np.mean(recent_temps)
-                historical_temps['std_24'] = np.std(recent_temps) if len(recent_temps) > 1 else 2.8
-            elif len(temp_history) > 0:
-                # Use available history for rolling stats
-                recent_temps = list(temp_history.values())
-                historical_temps['mean_24'] = np.mean(recent_temps)
-                historical_temps['std_24'] = np.std(recent_temps) if len(recent_temps) > 1 else 2.8
-            else:
-                # Use seasonal-adjusted base for initial estimates with hourly variation
-                base_est = 28.0 + seasonal_temp_adjustment
-                # Add hourly variation to the mean (represents average of last 24 hours)
-                hourly_mean_factor = np.sin(2 * np.pi * hour / 24) * 2.0
-                historical_temps['mean_24'] = base_est + hourly_mean_factor
-                historical_temps['std_24'] = 2.8 + np.abs(np.sin(2 * np.pi * hour / 24)) * 1.7  # 2.8-4.5°C
+            # Prepare historical temperatures dictionary for create_features
+            historical_temps = {}
+            if hist_features['lag_1'] is not None:
+                historical_temps[1] = hist_features['lag_1']
+            if hist_features['lag_3'] is not None:
+                historical_temps[3] = hist_features['lag_3']
+            if hist_features['lag_24'] is not None:
+                historical_temps[24] = hist_features['lag_24']
+            if hist_features['rolling_mean_24'] is not None:
+                historical_temps['mean_24'] = hist_features['rolling_mean_24']
+            if hist_features['rolling_std_24'] is not None:
+                historical_temps['std_24'] = hist_features['rolling_std_24']
+            
+            # For hours where we have predictions from previous hours in this forecast,
+            # prefer those over historical data for lag_1 and lag_3
+            if hour >= 1 and hour - 1 in temp_history:
+                historical_temps[1] = temp_history[hour - 1]
+            if hour >= 3 and hour - 3 in temp_history:
+                historical_temps[3] = temp_history[hour - 3]
+            
+            # For rolling stats, combine historical data with predictions from this forecast
+            if len(temp_history) > 0:
+                # Get recent historical temperatures (for hours before current forecast)
+                recent_hist_temps = []
+                for i in range(1, min(24, hour + 1)):
+                    check_datetime = forecast_datetime - timedelta(hours=i)
+                    hist_temp = get_historical_temperature(check_datetime)
+                    if hist_temp is not None:
+                        recent_hist_temps.append(hist_temp)
+                
+                # Combine with predictions from this forecast
+                combined_temps = recent_hist_temps + list(temp_history.values())
+                if len(combined_temps) >= 1:
+                    historical_temps['mean_24'] = np.mean(combined_temps[-24:]) if len(combined_temps) >= 24 else np.mean(combined_temps)
+                    if len(combined_temps) > 1:
+                        historical_temps['std_24'] = np.std(combined_temps[-24:]) if len(combined_temps) >= 24 else np.std(combined_temps)
+                    else:
+                        historical_temps['std_24'] = 2.8
             
             # Create features for this hour
             forecast_features_df = create_features(forecast_datetime, hour, historical_temps)
@@ -284,17 +391,16 @@ async def forecast_daily(request: DailyForecastRequest):
 def create_features(date_obj: datetime, hour: int, historical_temps: dict = None):
     """
     Create all 50 features required by the model.
-    Since we don't have real-time weather data, we'll use reasonable defaults
-    based on date/time and typical patterns for Cagayan de Oro.
+    Uses real historical data from the dataset for lag features and rolling statistics.
     
     Args:
         date_obj: Datetime object for the prediction
         hour: Hour of day (0-23)
         historical_temps: Dictionary with historical temperatures for lag features
-                          Format: {offset_hours: temperature}
+                          Format: {offset_hours: temperature} or {'mean_24': value, 'std_24': value}
     
     Returns:
-        numpy array with 50 features in the correct order
+        DataFrame with features in the correct order
     """
     month = date_obj.month
     day_of_week = date_obj.weekday()
@@ -308,17 +414,11 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
     rng = np.random.RandomState(seed)
     
     # Determine if summer - matches training notebook: months 6, 7, 8 (June-August)
-    # Note: This matches the training data definition, not typical Philippines summer
     is_summer = 1 if month in [6, 7, 8] else 0
     
     # Add seasonal temperature variation based on month and day of year
-    # Philippines has wet season (June-October) and dry season (November-May)
-    # Temperature varies by season with smooth transitions
-    # Use day_of_year for smooth seasonal curve instead of discrete month buckets
-    # Increased to ±2.5°C for more realistic seasonal variation
-    seasonal_temp_adjustment = np.sin(2 * np.pi * (day_of_year - 80) / 365.0) * 2.5  # Peak in April (day ~90-120)
-    # Add additional day-specific variation for more diversity
-    daily_temp_variation = np.sin(2 * np.pi * day_of_year / 7.0) * 0.8  # Weekly pattern, increased
+    seasonal_temp_adjustment = np.sin(2 * np.pi * (day_of_year - 80) / 365.0) * 2.5
+    daily_temp_variation = np.sin(2 * np.pi * day_of_year / 7.0) * 0.8
     seasonal_temp_adjustment += daily_temp_variation
     
     # Time-based features
@@ -326,21 +426,15 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
     hour_cos = np.cos(2 * np.pi * hour / 24)
     
     # Typical weather patterns for Cagayan de Oro (tropical climate)
-    # These are reasonable defaults - in production, you'd fetch real weather data
-    
     # Precipitation (mm) - higher in afternoon/evening, lower at night
-    # Vary by day of year for wet season (June-October) with smooth transitions
-    # Wet season roughly days 152-304 (June 1 - Oct 31)
     is_wet_season = 152 <= day_of_year <= 304
     if is_wet_season:
-        # Smooth transition into and out of wet season
-        wet_season_intensity = np.sin(np.pi * (day_of_year - 152) / 152.0)  # 0 to 1
+        wet_season_intensity = np.sin(np.pi * (day_of_year - 152) / 152.0)
         base_precipitation = (1.0 if hour >= 12 else 0.5) * wet_season_intensity
     else:
         base_precipitation = 0.3 if hour >= 12 else 0.0
     
-    # Add day-specific variation
-    daily_precip_variation = np.sin(2 * np.pi * day_of_year / 5.0) * 0.3  # 5-day cycle
+    daily_precip_variation = np.sin(2 * np.pi * day_of_year / 5.0) * 0.3
     precipitation = base_precipitation + daily_precip_variation + (rng.uniform(0, 1.5) if hour >= 12 else 0.0)
     rain = 1.0 if precipitation > 0.5 else 0.0
     
@@ -361,14 +455,12 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
     else:
         base_cloud = 60.0
     
-    # More clouds in wet season with smooth transition
     is_wet_season = 152 <= day_of_year <= 304
     if is_wet_season:
         wet_season_intensity = np.sin(np.pi * (day_of_year - 152) / 152.0)
         base_cloud += 15.0 * wet_season_intensity
     
-    # Add day-specific variation
-    daily_cloud_variation = np.sin(2 * np.pi * day_of_year / 7.0) * 5.0  # Weekly pattern
+    daily_cloud_variation = np.sin(2 * np.pi * day_of_year / 7.0) * 5.0
     cloud_cover = base_cloud + daily_cloud_variation + rng.uniform(-10, 20)
     cloud_cover = max(0, min(100, cloud_cover))
     
@@ -380,19 +472,15 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
     et0_fao_evapotranspiration = 4.0 + np.sin(2 * np.pi * hour / 24) * 2.0
     
     # Wind features (typical for Cagayan de Oro)
-    # Vary by day to make predictions different - use full day_of_year for unique values
-    # Add sine wave based on day of year to create smooth seasonal variation
     day_variation = np.sin(2 * np.pi * day_of_year / 365.0) * 1.5
-    wind_base = 2.0 + day_variation + (day_of_year / 365.0) * 0.5  # Varies throughout year
+    wind_base = 2.0 + day_variation + (day_of_year / 365.0) * 0.5
     wind_speed_10m = wind_base + rng.uniform(-0.5, 1.5)  # m/s
     wind_speed_100m = wind_speed_10m * 1.5
-    wind_direction_10m = 180.0 + np.sin(2 * np.pi * day_of_year / 365.0) * 30  # Seasonal variation
+    wind_direction_10m = 180.0 + np.sin(2 * np.pi * day_of_year / 365.0) * 30
     wind_direction_100m = wind_direction_10m + rng.uniform(-10, 10)
     wind_gusts_10m = wind_speed_10m * 1.3
     
     # Soil temperature (typical for tropical climate, varies with air temp)
-    # Use consistent base temperature calculation with lag features
-    # This ensures soil temp aligns with air temp estimates
     base_temp_soil = 28.0 + seasonal_temp_adjustment + np.sin(2 * np.pi * hour / 24) * 5.0
     soil_temperature_0_to_7cm = base_temp_soil + rng.uniform(-1, 1)
     soil_temperature_7_to_28cm = base_temp_soil - 1.0
@@ -435,19 +523,18 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
     global_tilted_irradiance_instant = global_tilted_irradiance
     terrestrial_radiation_instant = terrestrial_radiation
     
-    # Lag features - use historical temps if available, otherwise estimate
-    # Base temperature with seasonal adjustment (Cagayan de Oro: ~24-32°C range)
-    base_temp = 28.0 + seasonal_temp_adjustment  # Seasonal: ±2.5°C
+    # Lag features - use historical temps from dataset if available, otherwise estimate
+    base_temp = 28.0 + seasonal_temp_adjustment
     
     if historical_temps:
-        # Use provided historical temperatures, but ensure they're realistic
+        # Use provided historical temperatures (from dataset or previous predictions)
         temp_lag_1 = historical_temps.get(1)
         temp_lag_3 = historical_temps.get(3)
         temp_lag_24 = historical_temps.get(24)
         temp_rolling_mean_24 = historical_temps.get('mean_24')
         temp_rolling_std_24 = historical_temps.get('std_24')
         
-        # Fallback to estimated values if not provided (use same variation as main estimation)
+        # Fallback to estimated values if not provided
         if temp_lag_1 is None:
             prev_hour = (hour - 1) % 24
             temp_lag_1 = base_temp + np.sin(2 * np.pi * prev_hour / 24) * 5.0
@@ -463,48 +550,50 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
         if temp_rolling_std_24 is None:
             temp_rolling_std_24 = 2.8 + np.abs(np.sin(2 * np.pi * hour / 24)) * 1.7
     else:
-        # Estimate based on typical patterns with realistic hourly and seasonal variation
-        # Hourly variation: cooler at night (lowest ~4-6 AM), warmer during day (peak ~2-3 PM)
-        # Using sine wave: sin(0) at midnight = 0, peaks at noon, back to 0 at midnight
-        # Increased to ±5°C for more realistic daily temperature swings
-        hourly_variation = np.sin(2 * np.pi * hour / 24) * 5.0  # ±5°C variation
-        
-        # Lag 1 hour: previous hour's temperature
-        # Previous hour will be slightly different based on time of day
+        # Enhanced synthetic history so model can explore 22‑36 °C range
+        seasonal_offset = 0.0
+        if month in (12, 1, 2):
+            seasonal_offset -= 3.0
+        elif month in (3, 4, 5):
+            seasonal_offset += 3.0
+        elif month in (6, 7, 8):
+            seasonal_offset += 1.5
+        else:
+            seasonal_offset -= 1.0
+
+        daily_random_variation = rng.uniform(-2.0, 2.0)
+        hourly_amp = 6.0 + rng.uniform(-1.0, 2.0)  # ~±6–8 °C range
+
+        temp_baseline = 28.0 + seasonal_temp_adjustment + seasonal_offset + daily_random_variation
+
+        def temp_at_hour(h: int) -> float:
+            wave = np.sin(2 * np.pi * h / 24.0)
+            return temp_baseline + wave * hourly_amp
+
         prev_hour = (hour - 1) % 24
-        temp_lag_1 = base_temp + np.sin(2 * np.pi * prev_hour / 24) * 5.0
-        
-        # Lag 3 hours: 3 hours ago temperature
-        # This captures earlier in the day/night cycle
-        prev_3_hour = (hour - 3) % 24
-        temp_lag_3 = base_temp + np.sin(2 * np.pi * prev_3_hour / 24) * 5.0
-        
-        # Lag 24 hours: same hour yesterday (with seasonal adjustment)
-        # Should be similar to current hour but may have slight day-to-day variation
-        day_variation = np.sin(2 * np.pi * day_of_year / 365.0) * 0.8
-        temp_lag_24 = base_temp + hourly_variation + day_variation
-        
-        # Rolling mean: average of last 24 hours
-        # Should be close to base temperature with some smoothing
-        # The mean of a full day's sine wave is approximately the base
-        temp_rolling_mean_24 = base_temp + np.sin(2 * np.pi * hour / 24) * 2.0  # Increased variation for mean
-        
-        # Rolling std: standard deviation of last 24 hours
-        # Higher during day (more variation), lower at night (more stable)
-        # Typical daily std for Cagayan de Oro: 2.8-4.5°C
-        temp_rolling_std_24 = 2.8 + np.abs(np.sin(2 * np.pi * hour / 24)) * 1.7  # 2.8-4.5°C range
+        prev3_hour = (hour - 3) % 24
+        yesterday_hour = hour
+
+        temp_lag_1 = temp_at_hour(prev_hour) + rng.uniform(-0.8, 0.8)
+        temp_lag_3 = temp_at_hour(prev3_hour) + rng.uniform(-1.0, 1.0)
+        temp_lag_24 = temp_at_hour(yesterday_hour) + rng.uniform(-1.5, 1.5)
+
+        simulated_series = [
+            temp_at_hour((hour - i) % 24) + rng.uniform(-1.0, 1.0)
+            for i in range(1, 25)
+        ]
+        temp_rolling_mean_24 = float(np.mean(simulated_series))
+        rolling_std_raw = float(np.std(simulated_series))
+        temp_rolling_std_24 = float(np.clip(rolling_std_raw + rng.uniform(-0.3, 0.4), 1.5, 4.0))
     
     # Other lag features (estimated) - vary by date
-    # Higher humidity in wet season, with day-specific variation
     base_humidity = 75.0
     if month in [6, 7, 8, 9, 10]:  # Wet season
         base_humidity = 85.0
-    # Add day-specific variation using sine wave for smooth seasonal transition
     humidity_variation = np.sin(2 * np.pi * day_of_year / 365.0) * 5.0
     relative_humidity_2m_lag_1 = base_humidity + humidity_variation + (day_of_year / 10.0) % 3 - 1.5 + rng.uniform(-3, 3)
     dew_point_2m_lag_1 = temp_lag_1 - 5.0
     apparent_temperature_lag_1 = temp_lag_1 + 1.0
-    # Pressure varies by day with seasonal pattern
     pressure_variation = np.sin(2 * np.pi * day_of_year / 365.0) * 8.0
     pressure_msl_lag_1 = 1013.0 + pressure_variation + (day_of_year / 5.0) % 4 - 2.0 + rng.uniform(-3, 3)
     surface_pressure_lag_1 = pressure_msl_lag_1 - 10.0
@@ -518,7 +607,6 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
         raise ValueError("Model not loaded. EXPECTED_FEATURES is None. Call load_model() first.")
     
     # Create feature dictionary matching the exact model feature names
-    # This ensures we match the training notebook's feature engineering exactly
     feature_dict = {
         'precipitation': precipitation,
         'rain': rain,
@@ -555,7 +643,7 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
         'terrestrial_radiation_instant': terrestrial_radiation_instant,
         'hour_sin': hour_sin,
         'hour_cos': hour_cos,
-        'dayofweek': day_of_week,  # Note: model expects 'dayofweek' not 'day_of_week'
+        'dayofweek': day_of_week,
         'month': month,
         'is_summer': is_summer,
         'relative_humidity_2m_lag_1': relative_humidity_2m_lag_1,
@@ -576,14 +664,9 @@ def create_features(date_obj: datetime, hour: int, historical_temps: dict = None
     if EXPECTED_FEATURES is None:
         raise ValueError("Model not loaded. EXPECTED_FEATURES is None.")
     
-    # Create DataFrame with features in the exact order expected by the model
-    # This ensures features match the training notebook exactly
-    if EXPECTED_FEATURES is None:
-        raise ValueError("Model not loaded. EXPECTED_FEATURES is None. Call load_model() first.")
-    
     features_df = pd.DataFrame([[feature_dict[feat] for feat in EXPECTED_FEATURES]], columns=EXPECTED_FEATURES)
     
-    return features_df  # Return DataFrame directly for better compatibility with model
+    return features_df
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
@@ -597,18 +680,33 @@ async def predict(request: PredictionRequest):
     try:
         # Parse the date
         date_obj = datetime.fromisoformat(request.date)
+        date_obj = date_obj.replace(hour=request.hour, minute=0, second=0, microsecond=0)
         
         # Validate hour
         if not (0 <= request.hour <= 23):
             raise HTTPException(status_code=400, detail="Hour must be between 0 and 23")
         
+        # Get historical temperatures for lag features from the dataset
+        hist_features = get_lag_features_and_rolling_stats(date_obj, request.hour)
+        
+        # Prepare historical temperatures dictionary
+        historical_temps = {}
+        if hist_features['lag_1'] is not None:
+            historical_temps[1] = hist_features['lag_1']
+        if hist_features['lag_3'] is not None:
+            historical_temps[3] = hist_features['lag_3']
+        if hist_features['lag_24'] is not None:
+            historical_temps[24] = hist_features['lag_24']
+        if hist_features['rolling_mean_24'] is not None:
+            historical_temps['mean_24'] = hist_features['rolling_mean_24']
+        if hist_features['rolling_std_24'] is not None:
+            historical_temps['std_24'] = hist_features['rolling_std_24']
+        
         # Create features for the requested prediction
-        # Note: For lag features, we'll estimate them since we don't have historical data
-        features_df = create_features(date_obj, request.hour)
+        features_df = create_features(date_obj, request.hour, historical_temps)
         
         # Make prediction for the requested hour
         try:
-            # features_df is already a DataFrame with correct column names
             prediction = model.predict(features_df)
             requested_temp = float(prediction[0]) if hasattr(prediction, '__iter__') else float(prediction)
         except Exception as e:
@@ -621,7 +719,6 @@ async def predict(request: PredictionRequest):
         
         # Generate 24-hour forecast starting from requested hour
         hourly_forecast = []
-        # Store predictions for lag features
         temp_history = {0: requested_temp}
         
         for i in range(24):
@@ -629,32 +726,54 @@ async def predict(request: PredictionRequest):
             # Calculate the actual datetime for this forecast hour
             forecast_datetime = date_obj + timedelta(hours=i)
             
-            # Prepare historical temperatures for lag features
-            historical_temps = {}
-            if i >= 1:
-                historical_temps[1] = temp_history.get(i-1, requested_temp)
-            if i >= 3:
-                historical_temps[3] = temp_history.get(i-3, requested_temp)
-            if i >= 24:
-                historical_temps[24] = temp_history.get(i-24, requested_temp)
+            # Get historical temperatures for lag features from the dataset
+            hist_features = get_lag_features_and_rolling_stats(forecast_datetime, forecast_hour)
             
-            # Calculate rolling statistics if we have enough history
-            if len(temp_history) >= 24:
-                recent_temps = list(temp_history.values())[-24:]
-                historical_temps['mean_24'] = np.mean(recent_temps)
-                historical_temps['std_24'] = np.std(recent_temps) if len(recent_temps) > 1 else 2.0
+            # Prepare historical temperatures dictionary
+            historical_temps = {}
+            if hist_features['lag_1'] is not None:
+                historical_temps[1] = hist_features['lag_1']
+            if hist_features['lag_3'] is not None:
+                historical_temps[3] = hist_features['lag_3']
+            if hist_features['lag_24'] is not None:
+                historical_temps[24] = hist_features['lag_24']
+            if hist_features['rolling_mean_24'] is not None:
+                historical_temps['mean_24'] = hist_features['rolling_mean_24']
+            if hist_features['rolling_std_24'] is not None:
+                historical_temps['std_24'] = hist_features['rolling_std_24']
+            
+            # Prefer predictions from previous hours in this forecast for lag_1 and lag_3
+            if i >= 1 and i - 1 in temp_history:
+                historical_temps[1] = temp_history[i - 1]
+            if i >= 3 and i - 3 in temp_history:
+                historical_temps[3] = temp_history[i - 3]
+            
+            # For rolling stats, combine historical data with predictions from this forecast
+            if len(temp_history) > 0:
+                recent_hist_temps = []
+                for j in range(1, min(24, i + 1)):
+                    check_datetime = forecast_datetime - timedelta(hours=j)
+                    hist_temp = get_historical_temperature(check_datetime)
+                    if hist_temp is not None:
+                        recent_hist_temps.append(hist_temp)
+                
+                combined_temps = recent_hist_temps + list(temp_history.values())
+                if len(combined_temps) >= 1:
+                    historical_temps['mean_24'] = np.mean(combined_temps[-24:]) if len(combined_temps) >= 24 else np.mean(combined_temps)
+                    if len(combined_temps) > 1:
+                        historical_temps['std_24'] = np.std(combined_temps[-24:]) if len(combined_temps) >= 24 else np.std(combined_temps)
+                    else:
+                        historical_temps['std_24'] = 2.8
             
             # Create features for this forecast hour
             forecast_features_df = create_features(forecast_datetime, forecast_hour, historical_temps)
             
             try:
-                # forecast_features_df is already a DataFrame with correct column names
                 forecast_prediction = model.predict(forecast_features_df)
                 forecast_temp = float(forecast_prediction[0]) if hasattr(forecast_prediction, '__iter__') else float(forecast_prediction)
                 temp_history[i] = forecast_temp
             except Exception as e:
                 print(f"Forecast prediction error for hour {forecast_hour}: {str(e)}")
-                # Use a fallback temperature if prediction fails
                 forecast_temp = requested_temp
                 temp_history[i] = forecast_temp
             
