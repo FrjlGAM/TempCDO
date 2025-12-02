@@ -101,7 +101,7 @@ export const WeatherHeader = ({ temperature, queriedDate, queriedHour }: Weather
 
         <div className="mt-6">
           <span className="inline-block bg-weather-temp-label text-white px-4 py-2 rounded-lg text-sm font-semibold shadow-lg">
-            Current Temperature
+            Predicted Temperature
           </span>
         </div>
       </div>

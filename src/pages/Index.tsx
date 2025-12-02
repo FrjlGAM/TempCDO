@@ -144,14 +144,17 @@ const Index = () => {
             Loading prediction...
           </div>
         )}
-        {singlePrediction && queriedDate && queriedHour !== null && (
+        {singlePrediction && queriedDate && queriedHour !== null && dailyForecast && (
           <>
             <WeatherHeader 
-              temperature={singlePrediction.temperature} 
+              temperature={
+                // Use temperature from hourly forecast for the selected hour to ensure consistency
+                dailyForecast.forecast.find(item => item.hour === queriedHour)?.temperature ?? singlePrediction.temperature
+              } 
               queriedDate={queriedDate}
               queriedHour={queriedHour}
             />
-            <HourlyForecast forecastData={dailyForecast?.forecast} />
+            <HourlyForecast forecastData={dailyForecast.forecast} />
           </>
         )}
       </div>
