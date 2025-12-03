@@ -17,15 +17,27 @@ app = FastAPI(
 )
 
 # Configure CORS to allow frontend requests
+
+# Consolidated list of ALL allowed origins, including your Vercel domain
+origins = [
+    # VERCEL PRODUCTION DOMAIN (REQUIRED FIX)
+    "https://temp-cdo.vercel.app", 
+    # VERCEL PREVIEW DEPLOYMENTS (Useful for testing PRs)
+    "https://temp-cdo-git-*.vercel.app", 
+    # Local Development Environments
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8080",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8080",
+    # Add your Render domain if you need to access it directly (usually not needed)
+    "https://tempcdo.onrender.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Vite default port
-        "http://localhost:8080",  # Vite configured port
-        "http://localhost:3000",  # Alternative port
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:8080",
-    ],
+    # Use the consolidated 'origins' list here:
+    allow_origins=origins, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
